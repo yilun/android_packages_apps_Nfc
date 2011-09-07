@@ -70,7 +70,6 @@ import android.util.Log;
 
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
-import java.io.DataOutputStream;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
@@ -79,6 +78,7 @@ import java.nio.charset.Charsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 
@@ -221,6 +221,9 @@ public class NfcService extends Application {
     static final int MSG_MOCK_NDEF = 7;
     static final int MSG_SE_FIELD_ACTIVATED = 8;
     static final int MSG_SE_FIELD_DEACTIVATED = 9;
+    static final int MSG_SE_APDU_RECEIVED = 10;
+    static final int MSG_SE_EMV_CARD_REMOVAL = 11;
+    static final int MSG_SE_MIFARE_ACCESS = 12;
 
     // Copied from com.android.nfc_extras to avoid library dependency
     // Must keep in sync with com.android.nfc_extras
@@ -233,6 +236,19 @@ public class NfcService extends Application {
     public static final String ACTION_AID_SELECTED =
         "com.android.nfc_extras.action.AID_SELECTED";
     public static final String EXTRA_AID = "com.android.nfc_extras.extra.AID";
+
+    public static final String ACTION_APDU_RECEIVED =
+        "com.android.nfc_extras.action.APDU_RECEIVED";
+    public static final String EXTRA_APDU_BYTES =
+        "com.android.nfc_extras.extra.APDU_BYTES";
+
+    public static final String ACTION_EMV_CARD_REMOVAL =
+        "com.android.nfc_extras.action.EMV_CARD_REMOVAL";
+
+    public static final String ACTION_MIFARE_ACCESS_DETECTED =
+        "com.android.nfc_extras.action.MIFARE_ACCESS_DETECTED";
+    public static final String EXTRA_MIFARE_BLOCK =
+        "com.android.nfc_extras.extra.MIFARE_BLOCK";
 
     // Locked on mNfcAdapter
     PendingIntent mDispatchOverrideIntent;
@@ -256,7 +272,7 @@ public class NfcService extends Application {
     private final HashMap<Integer, Object> mObjectMap = new HashMap<Integer, Object>();
     private final HashMap<Integer, Object> mSocketMap = new HashMap<Integer, Object>();
     private boolean mScreenOn;
-    private String mSePackageName;
+    private HashSet<String> mSePackages = new HashSet<String>();
 
     // fields below are final after onCreate()
     Context mContext;
@@ -1821,6 +1837,12 @@ public class NfcService extends Application {
                 } catch (RemoteException e) {
                     mOpenEe.binderDied();
                 }
+
+                // Add the calling package to the list of packages that have accessed
+                // the secure element.
+                for (String packageName : getPackageManager().getPackagesForUid(getCallingUid())) {
+                    mSePackages.add(packageName);
+                }
            }
         }
 
@@ -1884,17 +1906,8 @@ public class NfcService extends Application {
         }
 
         @Override
-        public void registerTearDownApdus(String packageName, ApduList apdu) throws RemoteException {
+        public void authenticate(byte[] token) throws RemoteException {
             NfcService.enforceNfceeAdminPerm(mContext);
-            Log.w(TAG, "NOP");
-            //TODO: Remove this API
-        }
-
-        @Override
-        public void unregisterTearDownApdus(String packageName) throws RemoteException {
-            NfcService.enforceNfceeAdminPerm(mContext);
-            Log.w(TAG, "NOP");
-            //TODO: Remove this API
         }
     };
 
@@ -2464,8 +2477,45 @@ public class NfcService extends Application {
                Intent aidIntent = new Intent();
                aidIntent.setAction(ACTION_AID_SELECTED);
                aidIntent.putExtra(EXTRA_AID, aid);
-               if (DBG) Log.d(TAG, "Broadcasting ACTION_AID_SELECTED");
+               if (DBG) Log.d(TAG, "Broadcasting " + ACTION_AID_SELECTED);
                mContext.sendBroadcast(aidIntent, NFCEE_ADMIN_PERM);
+               break;
+
+           case MSG_SE_EMV_CARD_REMOVAL:
+               if (DBG) Log.d(TAG, "Card Removal message");
+               /* Send broadcast */
+               Intent cardRemovalIntent = new Intent();
+               cardRemovalIntent.setAction(ACTION_EMV_CARD_REMOVAL);
+               if (DBG) Log.d(TAG, "Broadcasting " + ACTION_EMV_CARD_REMOVAL);
+               mContext.sendBroadcast(cardRemovalIntent, NFCEE_ADMIN_PERM);
+               break;
+
+           case MSG_SE_APDU_RECEIVED:
+               if (DBG) Log.d(TAG, "APDU Received message");
+               byte[] apduBytes = (byte[]) msg.obj;
+               /* Send broadcast */
+               Intent apduReceivedIntent = new Intent();
+               apduReceivedIntent.setAction(ACTION_APDU_RECEIVED);
+               if (apduBytes != null && apduBytes.length > 0) {
+                 apduReceivedIntent.putExtra(EXTRA_APDU_BYTES, apduBytes);
+               }
+               if (DBG) Log.d(TAG, "Broadcasting " + ACTION_APDU_RECEIVED);
+               mContext.sendBroadcast(apduReceivedIntent, NFCEE_ADMIN_PERM);
+               break;
+
+           case MSG_SE_MIFARE_ACCESS:
+               if (DBG) Log.d(TAG, "MIFARE access message");
+               /* Send broadcast */
+               byte[] mifareCmd = (byte[]) msg.obj;
+               Intent mifareAccessIntent = new Intent();
+               mifareAccessIntent.setAction(ACTION_MIFARE_ACCESS_DETECTED);
+               if (mifareCmd != null && mifareCmd.length > 1) {
+                 int mifareBlock = mifareCmd[1] & 0xff;
+                 if (DBG) Log.d(TAG, "Mifare Block=" + mifareBlock);
+                 mifareAccessIntent.putExtra(EXTRA_MIFARE_BLOCK, mifareBlock);
+               }
+               if (DBG) Log.d(TAG, "Broadcasting " + ACTION_MIFARE_ACCESS_DETECTED);
+               mContext.sendBroadcast(mifareAccessIntent, NFCEE_ADMIN_PERM);
                break;
 
            case MSG_LLCP_LINK_ACTIVATION:
@@ -2972,8 +3022,9 @@ public class NfcService extends Application {
                     String packageName = data.getSchemeSpecificPart();
 
                     synchronized (NfcService.this) {
-                        if (packageName.equals(mSePackageName)) {
+                        if (mSePackages.contains(packageName)) {
                             executeSeReset();
+                            mSePackages.remove(packageName);
                         }
                     }
                 }
